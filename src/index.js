@@ -120,7 +120,7 @@ register(
     'bio and profile fields (FRC/FTC team number, rookie year, roles). Useful for judging how much weight to give a forum claim. ' +
     'Anonymous Discourse does not expose post counts or likes received, and it does not list that user posts — see the note in the output for why.',
   {
-    username: z.string().min(1).describe('Username without @, e.g. "cary_wang".'),
+    username: z.string().min(1).describe('Account name exactly as it appears at the end of a profile URL (/u/<this>), with no leading @.'),
     max_chars: maxChars,
   },
   ({ username, max_chars }) => tools.readUser({ username, max_chars })

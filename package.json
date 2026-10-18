@@ -9,7 +9,29 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "smoke": "node test/smoke.js"
+    "test": "node test/smoke.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chief-delphi",
+    "discourse",
+    "frc",
+    "first-robotics",
+    "read-only"
+  ],
+  "author": "Cary",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CaryWang1234/delphi-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CaryWang1234/delphi-mcp/issues"
   },
   "engines": {
     "node": ">=18"

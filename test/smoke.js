@@ -69,8 +69,10 @@ check('cd_raw post range', !raw.isError && /CD topic 519808/.test(raw.text), `${
 const big = await call('cd_raw', { topic: 519808, max_chars: 2000 });
 check('cd_raw honours max_chars', !big.isError && big.text.length < 2600 && /truncated/.test(big.text), `${big.text.length} chars`);
 
-const user = await call('cd_user', { username: '@CARY_WANG' });
-check('cd_user', !user.isError && /username: Cary_Wang/i.test(user.text) && /FRC Team Number/.test(user.text), `${user.text.length} chars · ${user.text.split('\n').filter((l) => /trust_level|profile fields/.test(l)).join(' || ')}`);
+// Pick a real account out of the live listing instead of hardcoding anyone's username.
+const sampleAuthor = /by=([^\s|]+)/.exec(latest.text)?.[1];
+const user = await call('cd_user', { username: sampleAuthor });
+check('cd_user', !user.isError && new RegExp(`username: ${sampleAuthor}`, 'i').test(user.text), `probed "${sampleAuthor}" · ${user.text.length} chars · ${user.text.split('\n').filter((l) => /trust_level|profile fields/.test(l)).join(' || ')}`);
 
 const badUser = await call('cd_user', { username: 'no-such-user-88817' });
 check('cd_user rejects unknown account', badUser.isError && /404/.test(badUser.text), badUser.text.slice(0, 90));
@@ -83,6 +85,14 @@ try {
   guardBlocked = err?.name;
 }
 check('robots guard blocks /search.json', guardBlocked === 'RobotsBlockedError', String(guardBlocked));
+
+let rssBlocked = null;
+try {
+  await getJson('/c/technical/9.rss');
+} catch (err) {
+  rssBlocked = err?.name;
+}
+check('robots guard blocks disallowed category feed (/c/*.rss)', rssBlocked === 'RobotsBlockedError', String(rssBlocked));
 
 let adminBlocked = null;
 try {
