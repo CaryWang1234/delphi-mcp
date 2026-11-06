@@ -1,4 +1,4 @@
-import { getJson, getText, topicUrl, BASE_URL, CACHE_TTL } from './discourse.js';
+import { getJson, getText, topicUrl, BASE_URL, CACHE_TTL, readState, writeState, clearState } from './discourse.js';
 
 const DEFAULT_MAX_CHARS = 20000;
 
@@ -10,20 +10,25 @@ function clip(text, max = DEFAULT_MAX_CHARS) {
 function htmlToText(html) {
   let out = html;
   out = out.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_m, inner) => `\n\`\`\`\n${inner.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')}\n\`\`\`\n`);
-  out = out.replace(/<(blockquote|div|p|li|ul|ol|h[1-6]|tr|br|\/blockquote|\/div)[^>]*>/gi, '\n');
+  // Angle brackets are deliberately not used around the URL: the generic tag-stripping
+  // pass below would eat "<https://…>" as if it were markup.
   out = out.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, label) => {
     const text = label.replace(/<[^>]+>/g, '').trim();
     const resolved = href.startsWith('/') ? `${BASE_URL}${href}` : href;
     if (!text || text === resolved) return resolved;
-    return `${text} <${resolved}>`;
+    return `${text} (${resolved})`;
   });
   out = out.replace(/<img[^>]*>/gi, (m) => {
     const src = /src="([^"]*)"/i.exec(m)?.[1] ?? '';
     return src ? `[image: ${src.startsWith('http') ? src : `${BASE_URL}${src}`}]` : '[image]';
   });
+  // Table cells first, so the row break that follows does not swallow the column gap.
+  out = out.replace(/<\/t[dh]>/gi, '\t');
+  out = out.replace(/<\/?(?:blockquote|div|p|li|ul|ol|h[1-6]|tr|table|tbody|thead|section|article)[^>]*>/gi, '\n');
+  out = out.replace(/<br\s*\/?>/gi, '\n');
   out = out.replace(/<[^>]+>/g, '');
   out = decodeEntities(out);
-  return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/\t\n/g, '\n').trim();
 }
 
 function decodeEntities(text) {
@@ -297,11 +302,15 @@ export async function findTopics({ query, mode, category, period, order, pages, 
   return clip(lines.join('\n'), max_chars);
 }
 
+// A Discourse topic URL takes a post number, not a page. Requesting a window renders
+// chunk_size posts starting five before the anchor, so anchor = desired start + 5.
+export function topicWindowPath(topic, first) {
+  return first <= 1 ? `/t/${topic}.json` : `/t/${topic}/${first + 5}.json?context=${first + 5}`;
+}
+
 export async function readTopic({ topic, page, at_post, chunk, max_posts, format, max_chars }) {
   const first = at_post ?? 1 + (page - 1) * chunk;
-  // A Discourse topic URL takes a post number, not a page. Requesting a window renders
-  // chunk_size posts starting five before the anchor, so anchor = desired start + 5.
-  const path = first <= 1 ? `/t/${topic}.json` : `/t/${topic}/${first + 5}.json?context=${first + 5}`;
+  const path = topicWindowPath(topic, first);
   let data;
   try {
     data = await getJson(path, { ttl: CACHE_TTL.topic });
@@ -431,4 +440,101 @@ export async function readUser({ username, max_chars }) {
   return clip(lines.join('\n'), max_chars);
 }
 
+export function snapshotTopics(list) {
+  const out = {};
+  for (const t of list) {
+    out[String(t.id)] = {
+      title: t.title,
+      posts: t.posts_count ?? 0,
+      views: t.views ?? 0,
+      last: t.last_posted_at ?? t.created_at ?? null,
+      by: t.last_poster_username ?? null,
+    };
+  }
+  return out;
+}
+
+export function diffWatch(previousTopics, currentList) {
+  const news = [];
+  const updated = [];
+  for (const topic of currentList) {
+    const before = previousTopics?.[String(topic.id)];
+    if (!before) {
+      news.push(topic);
+      continue;
+    }
+    const postDelta = (topic.posts_count ?? 0) - before.posts;
+    const viewDelta = (topic.views ?? 0) - before.views;
+    const lastNow = topic.last_posted_at ?? topic.created_at ?? null;
+    if (postDelta > 0 || lastNow !== before.last) {
+      updated.push({ topic, postDelta, viewDelta });
+    }
+  }
+  const currentIds = new Set(currentList.map((t) => String(t.id)));
+  const dropped = Object.keys(previousTopics ?? {}).filter((id) => !currentIds.has(id));
+  return { news, updated, dropped };
+}
+
+export async function watchTopics({ mode, category, period, order, limit, reset, max_chars }) {
+  const cat = await resolveCategory(category);
+  const key = `watch:${mode}:${cat?.id ?? 'all'}:${mode === 'top' ? period : 'n/a'}:${order ?? 'default'}`;
+  if (reset) await clearState(key);
+  const previous = await readState(key);
+  const topics = await fetchTopicList({ mode, category: cat, period, order, page: 0, ttl: 0 });
+  const saved = await writeState(key, { key, takenAt: new Date().toISOString(), topics: snapshotTopics(topics) });
+
+  const scope = cat ? `${cat.name} [${cat.slug}]` : 'the whole forum';
+  const head = [
+    `cd_watch: ${mode}${mode === 'top' ? `/${period}` : ''} in ${scope}`,
+    `Snapshot now: ${topics.length} topics${saved ? '' : ' (state write failed — deltas will not persist)'}`,
+  ];
+
+  if (!previous) {
+    const rows = topics.slice(0, limit).map((t) => `#${t.id} | ${t.title} | posts=${t.posts_count} cat=${t.category_id} last=${String(t.last_posted_at || t.created_at).slice(0, 16).replace('T', ' ')}`);
+    return clip([...head, 'Baseline recorded. Nothing to compare against yet — call cd_watch again to get what changed since this moment.', '', ...rows].join('\n'), max_chars);
+  }
+
+  const { news, updated, dropped } = diffWatch(previous.topics, topics);
+  const lines = [...head, `Compared with snapshot taken ${previous.takenAt}: ${news.length} new, ${updated.length} active, ${dropped.length} left the window.`];
+  if (!news.length && !updated.length) {
+    lines.push('', 'No new topics and no new posts in this window since then.');
+  }
+  if (news.length) {
+    lines.push('', 'NEW TOPICS');
+    for (const t of news.slice(0, limit)) {
+      lines.push(topicRow(t));
+    }
+    if (news.length > limit) lines.push(`  …${news.length - limit} more new topics not shown`);
+  }
+  if (updated.length) {
+    lines.push('', 'TOPICS WITH NEW ACTIVITY');
+    updated.sort((a, b) => b.postDelta - a.postDelta || b.viewDelta - a.viewDelta);
+    for (const { topic: t, postDelta, viewDelta } of updated.slice(0, limit)) {
+      lines.push(`#${t.id} +${postDelta} posts (${previous.topics[String(t.id)].posts}→${t.posts_count}) +${viewDelta} views | ${t.title} | last by=${t.last_poster_username ?? '?'}`);
+    }
+    if (updated.length > limit) lines.push(`  …${updated.length - limit} more not shown`);
+  }
+  if (dropped.length) {
+    lines.push('', `Left the window (no longer listed on page 0 — that is not the same as deleted): ${dropped.slice(0, 10).map((id) => `#${id}`).join(' ')}`);
+  }
+  lines.push('', `cd_watch reads only page 0 of the listing, so widen scope with category=/mode=/period= as threads age out. State resets are per scope.`);
+  return clip(lines.join('\n'), max_chars);
+}
+
 export const TOOL_DEFAULTS = { DEFAULT_MAX_CHARS };
+
+// Exposed for test/unit/*.test.js — parsing and arithmetic that must be provable offline.
+export {
+  clip,
+  htmlToText,
+  decodeEntities,
+  parseRef,
+  listPath,
+  tokenize,
+  countIn,
+  scoreTopic,
+  firstWindow,
+  poolsFor,
+  splitRawPosts,
+  topicRow,
+};

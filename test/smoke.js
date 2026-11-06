@@ -1,6 +1,19 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getJson } from '../src/discourse.js';
+
+const STATE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.state');
+
+async function stateFileCount() {
+  try {
+    return (await readdir(STATE_DIR)).filter((f) => f.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+}
 
 const client = new Client({ name: 'smoke', version: '0.0.1' });
 const transport = new StdioClientTransport({
@@ -24,7 +37,7 @@ async function call(name, args) {
 }
 
 const listed = await client.listTools();
-check('tools/list', listed.tools.length === 6, `${listed.tools.length} tools: ${listed.tools.map((t) => t.name).join(', ')}`);
+check('tools/list', listed.tools.length === 7, `${listed.tools.length} tools: ${listed.tools.map((t) => t.name).join(', ')}`);
 
 const cats = await call('cd_categories', {});
 check('cd_categories', !cats.isError && /announcements/i.test(cats.text), `${cats.text.length} chars`);
@@ -39,7 +52,15 @@ const badCat = await call('cd_topics', { category: 'not-a-real-category' });
 check('cd_topics rejects unknown category', badCat.isError && /matches/.test(badCat.text), badCat.text.slice(0, 90));
 
 const found = await call('cd_find', { query: 'game prediction', pages: 4, with_body: 3, limit: 5 });
-check('cd_find auto-pool finds the 2027 prediction thread', !found.isError && found.text.includes('#519808'), `pool line: ${/Pool: .*/.exec(found.text)?.[0] ?? 'none'}`);
+const poolLine = /Pool: (\d+) distinct topics from (.*) \((\d+) list requests\)/.exec(found.text);
+check('cd_find auto mode pools top AND latest', poolLine && /top\/yearly \d+p→\d+, latest \d+p→\d+/.test(poolLine[2]), poolLine?.[0]);
+const scoreLine = [...found.text.matchAll(/#(\d+) score=([\d.]+)/g)];
+check(
+  'cd_find returns ranked hits in descending score order',
+  scoreLine.length >= 1 && scoreLine.every((m, i) => i === 0 || Number(m[2]) <= Number(scoreLine[i - 1][2])),
+  `${scoreLine.length} hit(s), scores ${scoreLine.map((m) => m[2]).join(' ≥ ')}`
+);
+check('cd_find states its own coverage limit', /not a full-text index/i.test(found.text), 'coverage disclaimer present');
 check('cd_find body check reports post numbers', /body: matched in #\d+ \(/.test(found.text), found.text.split('\n').find((l) => l.includes('body: matched'))?.slice(0, 120) ?? 'no body line');
 
 const noHit = await call('cd_find', { query: 'zzqxv-never-a-forum-word', pages: 1, with_body: 0 });
@@ -76,6 +97,43 @@ check('cd_user', !user.isError && new RegExp(`username: ${sampleAuthor}`, 'i').t
 
 const badUser = await call('cd_user', { username: 'no-such-user-88817' });
 check('cd_user rejects unknown account', badUser.isError && /404/.test(badUser.text), badUser.text.slice(0, 90));
+
+const base = await call('cd_watch', { mode: 'latest', category: 'technical', reset: true });
+check('cd_watch baselines on first call', !base.isError && /Baseline recorded/.test(base.text), `${base.text.length} chars`);
+
+const stateFiles = await stateFileCount();
+check('cd_watch persists state outside the disposable cache', stateFiles >= 1, `${stateFiles} state file(s) in .state/`);
+
+const second = await call('cd_watch', { mode: 'latest', category: 'technical' });
+check('cd_watch reports a delta against the stored baseline', !second.isError && /Compared with snapshot taken \d{4}-\d{2}-\d{2}T/.test(second.text), /Compared with.*window\./.exec(second.text)?.[0]);
+
+// Prove the diff path end-to-end without depending on the forum having changed since
+// the baseline: age one entry in the stored snapshot, then expect an exact delta.
+const stateFile = path.join(STATE_DIR, (await readdir(STATE_DIR)).find((f) => f.endsWith('.json')));
+const snapshot = JSON.parse(await readFile(stateFile, 'utf8'));
+const targetId = Object.keys(snapshot.topics)[0];
+const tammedFrom = Math.max(0, Number(snapshot.topics[targetId].posts) - 3);
+snapshot.topics[targetId].posts = tammedFrom;
+snapshot.topics[targetId].last = '2000-01-01T00:00:00.000Z';
+await writeFile(stateFile, JSON.stringify(snapshot), 'utf8');
+
+const tampered = await call('cd_watch', { mode: 'latest', category: 'technical' });
+const delta = new RegExp(`#${targetId} \\+(\\d+) posts \\((\\d+)→(\\d+)\\)`).exec(tampered.text);
+check(
+  'cd_watch computes the delta from the stored baseline',
+  Boolean(delta) &&
+    delta[2] === String(tammedFrom) &&
+    Number(delta[3]) - Number(delta[2]) === Number(delta[1]) &&
+    tampered.text.includes('TOPICS WITH NEW ACTIVITY'),
+  `topic #${targetId}: ${delta?.[0] ?? 'no delta line'} (baseline was faked to ${tammedFrom} posts)`
+);
+
+const resetAgain = await call('cd_watch', { mode: 'latest', category: 'technical', reset: true });
+check(
+  'cd_watch reset discards the baseline instead of comparing',
+  !resetAgain.isError && /Baseline recorded/.test(resetAgain.text) && !/Compared with/.test(resetAgain.text),
+  `${resetAgain.text.length} chars, no comparison header`
+);
 
 // The robots.txt guard is the load-bearing compliance claim, so prove it bites.
 let guardBlocked = null;

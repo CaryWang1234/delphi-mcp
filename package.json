@@ -1,15 +1,20 @@
 {
-  "name": "delphi-mcp",
+  "name": "chief-delphi-mcp",
   "version": "0.1.0",
   "description": "Read-only MCP server exposing Chief Delphi (Discourse) forum data to agents",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "delphi-mcp": "src/index.js"
+    "chief-delphi-mcp": "src/index.js"
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/smoke.js"
+    "test": "node --test \"test/unit/*.test.js\"",
+    "test:live": "node test/smoke.js",
+    "test:all": "node --test \"test/unit/*.test.js\" && node test/smoke.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "src",

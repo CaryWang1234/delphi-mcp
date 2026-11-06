@@ -126,6 +126,25 @@ register(
   ({ username, max_chars }) => tools.readUser({ username, max_chars })
 );
 
+register(
+  'cd_watch',
+  'Report what changed in a Chief Delphi listing since the previous cd_watch call on the same scope: brand-new topics, plus topics whose post or view ' +
+    'counts moved, with deltas. The first call records a baseline and lists nothing new; call it again later to get the diff. ' +
+    'Made for following an ongoing discussion — game rumor and prediction threads during a season, a build thread you are tracking, or one category during ' +
+    'kickoff week — without re-reading the same listings. State persists in .state/ (separate from the disposable cache), is keyed per scope, and `reset` starts over.',
+  {
+    mode: z.enum(MODES).optional().describe('Listing to diff. Default "latest" (best for watching); "top" also works.'),
+    category: z.string().optional().describe('Category id/slug to watch. Omit for the whole forum.'),
+    period: z.enum(PERIODS).optional().describe('For mode=top. Default "daily".'),
+    order: z.enum(ORDERS).optional().describe('Listing sort. Defaults to the feed order.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Rows per section. Default 25.'),
+    reset: z.boolean().optional().describe('Discard the stored baseline first, so this call becomes the new starting point. Default false.'),
+    max_chars: maxChars,
+  },
+  ({ mode = 'latest', category, period = 'daily', order, limit = 25, reset = false, max_chars }) =>
+    tools.watchTopics({ mode, category, period, order, limit, reset, max_chars })
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

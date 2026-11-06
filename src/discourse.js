@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -59,7 +59,7 @@ async function writeCache(key, body) {
   }
 }
 
-function parseRobots(text) {
+export function parseRobots(text) {
   const rules = [];
   let agents = [];
   let groupOpen = false;
@@ -87,11 +87,11 @@ function parseRobots(text) {
   return rules;
 }
 
-function matchesAgent(rule, uaToken) {
+export function matchesAgent(rule, uaToken) {
   return rule.agents.some((agent) => agent === '*' || (agent.length > 0 && uaToken.startsWith(agent)));
 }
 
-function toPattern(robotsPath) {
+export function toPattern(robotsPath) {
   const escaped = robotsPath.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '\u0000').replace(/\?/g, '\\?');
   const body = escaped.replace(/\u0000/g, '.*');
   const anchored = body.startsWith('/') ? `^${body}` : `^.*${body}`;
@@ -114,19 +114,27 @@ async function loadRobots() {
   return robotsPromise;
 }
 
-async function assertAllowed(pathWithQuery) {
-  const rules = await loadRobots();
-  if (!rules) return;
-  const uaToken = USER_AGENT.split(/[\s(/]/)[0].toLowerCase();
+export function uaTokenOf(userAgent) {
+  return String(userAgent).split(/[\s(/]/)[0].toLowerCase();
+}
+
+// RFC 9309 longest-match: the most specific path rule that matches wins, and a
+// matching Allow outweighs a matching Disallow.
+export function isAllowed(rules, pathWithQuery, uaToken) {
   let best = null;
   for (const rule of rules) {
     if (!matchesAgent(rule, uaToken)) continue;
     if (!toPattern(rule.path).test(pathWithQuery)) continue;
     if (best === null || rule.path.length > best.path.length) best = rule;
   }
-  if (best && !best.allow) {
-    throw new RobotsBlockedError(pathWithQuery, best.path);
-  }
+  return { allowed: !best || best.allow, rule: best };
+}
+
+async function assertAllowed(pathWithQuery) {
+  const rules = await loadRobots();
+  if (!rules) return;
+  const { allowed, rule } = isAllowed(rules, pathWithQuery, uaTokenOf(USER_AGENT));
+  if (!allowed) throw new RobotsBlockedError(pathWithQuery, rule.path);
 }
 
 export class RobotsBlockedError extends Error {
@@ -167,6 +175,43 @@ async function request(pathWithQuery, { accept, as, ttl }) {
 
 export function getJson(pathWithQuery, { ttl = TTL.list } = {}) {
   return request(pathWithQuery, { accept: 'application/json', as: 'json', ttl });
+}
+
+// Watch baselines are deliberately not in .cache: the cache is disposable by design,
+// and losing it would silently turn "what changed since last time" back into a full listing.
+const STATE_DIR = process.env.DELPHI_STATE_DIR || path.join(ROOT, '.state');
+
+function statePath(key) {
+  return path.join(STATE_DIR, `${createHash('sha1').update(key).digest('hex')}.json`);
+}
+
+export async function readState(key) {
+  try {
+    return JSON.parse(await readFile(statePath(key), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export async function writeState(key, value) {
+  try {
+    await mkdir(STATE_DIR, { recursive: true });
+    await writeFile(statePath(key), JSON.stringify(value), 'utf8');
+    return true;
+  } catch (err) {
+    process.stderr.write(`delphi-mcp: state write failed (${err.message})\n`);
+    return false;
+  }
+}
+
+export async function clearState(key) {
+  try {
+    await rm(statePath(key), { force: true });
+    return true;
+  } catch (err) {
+    process.stderr.write(`delphi-mcp: state clear failed (${err.message})\n`);
+    return false;
+  }
 }
 
 export function getText(pathWithQuery, { ttl = TTL.topic } = {}) {

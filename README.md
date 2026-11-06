@@ -10,7 +10,12 @@ uses, and it enforces the site's `robots.txt` in code rather than in a comment.
 ```
 cd_categories  →  cd_find / cd_topics  →  cd_raw / cd_topic  →  cd_user
    scope it          find the thread        read the thread      vet the claim
+
+cd_watch  →  what changed in a listing since you last looked
 ```
+
+The npm package name is **`chief-delphi-mcp`**. `delphi-mcp` was already taken on npm by an unrelated
+project (a multi-model consensus tool), so the repository keeps the short name while the package does not.
 
 ## Why this exists
 
@@ -22,10 +27,19 @@ is the attempt at getting useful recall *without* that endpoint. See
 
 ## Requirements
 
-- Node.js 18 or newer (global `fetch`; developed and tested on Node 24)
+- Node.js 18 or newer to run the server (global `fetch`; developed and tested on Node 24)
+- Node.js 21 or newer for `npm test`, which passes a glob to `node --test`
 - No build step — plain ESM JavaScript
 
 ## Install
+
+From npm:
+
+```bash
+npm install -g chief-delphi-mcp
+```
+
+From the repository:
 
 ```bash
 git clone https://github.com/CaryWang1234/delphi-mcp.git
@@ -35,8 +49,19 @@ npm install
 
 ## Connect it to your MCP client
 
-All clients take the same stdio entry; only the config file differs. Point `args` at the absolute path of
-`src/index.js`.
+All clients take the same stdio entry; only the config file differs.
+
+If you installed globally, the package provides a `chief-delphi-mcp` command:
+
+```json
+{
+  "mcpServers": {
+    "chief-delphi": { "command": "chief-delphi-mcp" }
+  }
+}
+```
+
+Otherwise point `args` at the absolute path of `src/index.js`:
 
 ```json
 {
@@ -75,6 +100,7 @@ context.
 | `cd_topic` | A thread window with per-post metadata: author, user title, timestamp, likes, which post is replied to, post id, deleted/hidden flags. | `topic` `at_post` `page=1` `chunk=20` `max_posts=20` `format=text` |
 | `cd_raw` | A thread as plain Discourse markdown — the cheapest full read. | `topic` `start_post` `end_post` |
 | `cd_user` | An account profile: trust level, titles, join/last-seen/last-posted, profile views, time read, badges, location, website, bio, and profile fields such as team number. | `username` |
+| `cd_watch` | What changed in one listing since the previous `cd_watch` on the same scope: new topics, plus per-topic `+N posts (from→to)` and view deltas. First call only records a baseline. | `mode=latest` `category` `period=daily` `limit=25` `reset` |
 
 Listing rows and search hits carry the topic id, which is what `cd_topic` and `cd_raw` take. URLs are
 `${DELPHI_BASE_URL}/t/<slug>/<id>`.
@@ -106,7 +132,9 @@ Consequences worth knowing before you file a "search is broken" issue:
 Being polite to the host is the other half of the same section: all requests are serialized through one
 queue with a 350 ms floor (`DELPHI_MIN_INTERVAL_MS`) because Chief Delphi sits behind Cloudflare and
 parallel or rapid-fire requests get challenged, and every response is cached on disk so a repeat call costs
-nothing.
+nothing. The one exception is `cd_watch`, which reads the listing uncached on purpose — a stale snapshot
+would defeat the tool — so each watch call is exactly one request, and repeated watching is what the
+throttle is there to keep cheap.
 
 | Cache | Default TTL |
 | --- | --- |
@@ -121,7 +149,7 @@ made against the site's stated policy, so this project would rather not ship it.
 
 ## Using it against another Discourse forum
 
-The server is not Chief Delphi-specific: set `DELPHI_BASE_URL` to any Discourse forum and the same six
+The server is not Chief Delphi-specific: set `DELPHI_BASE_URL` to any Discourse forum and the same seven
 tools read it. Check that forum's `robots.txt` first — the guard will adapt automatically and may simply
 refuse the endpoints you wanted.
 
@@ -135,18 +163,42 @@ refuse the endpoints you wanted.
 | `DELPHI_USER_AGENT` | `delphi-mcp/0.1 (+read-only Discourse client)` | The token `robots.txt` rules are matched against |
 | `DELPHI_CACHE_DIR` | `<repo>/.cache` | Delete the directory to force a refetch; there is no cache-off switch |
 
+| `DELPHI_CACHE_DIR` | `<repo>/.cache` | Delete the directory to force a refetch; there is no cache-off switch |
+| `DELPHI_STATE_DIR` | `<repo>/.state` | `cd_watch` baselines. Kept out of the cache on purpose: clearing a cache should not silently erase what you are watching |
+
 ## Tests
 
 ```bash
-npm test
+npm test          # 52 offline assertions, no network
+npm run test:live # 27 assertions against the live forum
+npm run test:all  # both
 ```
 
-`test/smoke.js` spawns the real server, speaks stdio to it over the official client, and runs 20
-assertions against the live forum: every tool, the pagination contract, unknown-category / unknown-topic /
-unknown-user error paths, the `max_chars` budget, and four assertions dedicated to the guard —
-`/search.json` blocked, `/admin/logs.json` blocked, `/c/technical/9.rss` blocked, and a **control** proving
-`/latest.json` still passes. An assertion that only shows blocking works is not evidence; the guard has to
-be shown not to block everything. Cold run ~21 s, warm run ~3.5 s.
+**`npm test` is the offline one and belongs in CI.** `test/unit/*.test.js` covers the logic that can be
+proven without touching chiefdelphi.com — `robots.txt` group parsing and longest-match decisions, listing URL
+construction, the post-window anchor arithmetic, `/raw` post splitting, HTML-to-text, ranking weights, the
+`max_chars` budget, and the watch diff. Fixtures are hand-written synthetic payloads: this repo does not
+commit scraped forum text or user data, and it never should, since posts belong to the people who wrote them.
+
+**`npm run test:live` is deliberately not wired into CI.** It spawns the server over stdio and hits the real
+site, and a scheduled job doing that turns this project into a periodic crawler against a third-party forum —
+plus it goes red on any network blip. Run it by hand after touching the request layer. It checks every tool,
+error paths, the `max_chars` budget, and the guard: `/search.json`, `/admin/logs.json` and
+`/c/technical/9.rss` blocked, with a **control** proving `/latest.json` still passes. Blocking alone is not
+evidence; the guard has to be shown not to block everything.
+
+Two habits worth copying if you extend the suite:
+
+- **Assert mechanism, not forum state.** An earlier version asserted that a specific game-prediction thread
+  would appear in `cd_find`'s default pool. It passed in October and went red once that thread left the
+  yearly-top window — the test was measuring the forum, not the code. It now asserts that the auto pool
+  really merged `top` and `latest`, that hits come back in descending score order, and that the output
+  carries its own coverage disclaimer.
+- **Create the condition instead of waiting for it.** The watch delta is proven by rewriting the stored
+  baseline to claim fewer posts, then checking the reported `from→to` pair against it. That works whether or
+  not anybody posted in the meantime.
+
+Cold live run ~40 s; warm ~4 s.
 
 ## Upstream facts worth knowing before you patch this
 
@@ -173,6 +225,43 @@ Verified against the live site, and the reason several first drafts of these too
 | Tools missing in the client | Host has not loaded the connector: `/mcp reload` or restart. |
 | Stale tool description after an edit | Same — hosts cache `tools/list`. |
 | Client reports a stdio initialization timeout | This server does no network I/O at startup, so check the `command` path resolves; on Windows use an absolute one. |
+
+## Publishing
+
+Only maintainers need this. `files` in `package.json` limits the tarball to `src`, `README.md` and `LICENSE`,
+so neither fixtures nor cached forum data can ship by accident.
+
+```bash
+npm pack --dry-run          # confirm what lands in the tarball
+npm publish                 # 2FA is enforced for publish
+npm view chief-delphi-mcp version dist-tags.latest
+```
+
+Two things worth knowing before your first release, both learned the hard way:
+
+- **A brand-new package goes through staged publishing.** npm now queues the first release of a name that
+  does not exist yet: the publish call lands a public placeholder version `0.0.0-stage` (`"stub": true`,
+  "Temporary package placeholder for staged publishing") and holds the real version for maintainer approval.
+  Approve it on npmjs.com under **Staged Packages**, or from the CLI with `npm stage list` / `npm stage view`
+  / `npm stage approve` — which needs npm ≥ 11.15.0 and Node ≥ 22.14; approval always asks for 2FA even if
+  staging did not. Until you approve, `latest` points at the stub and `npm install` hands people an inert
+  two-file placeholder, so verify `dist-tags.latest` after approving rather than assuming success. Rejecting
+  the staged version leaves that stub published, so clear it instead of leaving it dangling.
+- **Plain `npm publish` fails with 403 on a 2FA account** (`Two-factor authentication or granular access
+  token with bypass 2fa enabled is required`). Either pass a one-time code — `npm publish --otp=123456` — or
+  use a granular access token scoped to this package with 2FA bypass, injected as `npm_config_token` for the
+  single command. Never commit a token, and prefer the one-time code when publishing by hand.
+
+The release is only real once the *published artifact* runs. Install it somewhere clean and speak MCP to it,
+because this proves the tarball is self-contained in a way a working local checkout cannot:
+
+```bash
+mkdir /tmp/verify && npm install chief-delphi-mcp --prefix /tmp/verify --no-save
+node /tmp/verify/node_modules/chief-delphi-mcp/src/index.js   # should wait on stdio, not crash on import
+```
+
+`publishConfig.access` is already `public`, so the publish command does not need the flag. If your npm
+account has two-factor auth, publish needs an automation or a one-time password from your authenticator.
 
 ## Disclaimer
 
